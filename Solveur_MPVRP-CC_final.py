@@ -1,36 +1,41 @@
 """
-Solveur MPVRP-CC (Multi-Product Vehicle Routing Problem with Changeover Cost)
-Utilise OR-Tools CP-SAT pour la résolution
-Format d'entrée: fichiers .dat selon la spécification
-Format de sortie: fichiers .dat selon la spécification
+================================================================================
+SOLVEUR MPVRP-CC - VERSION FINALE
+Multi-Product Vehicle Routing Problem with Changeover Cost
+
+Basé sur la modélisation officielle (MVRP-CC_2.pdf)
+Génère des solutions au format officiel (solution_description fr.pdf)
+================================================================================
+
+Installation : pip install ortools
+
+Auteurs : Groupe 15
+Date : 31 Janvier 2026
 """
 
-import os
+from ortools.linear_solver import pywraplp
 import math
-import time
-import uuid
-from typing import Dict, List, Tuple, Optional
+import time as time_module
 from dataclasses import dataclass
-from ortools.sat.python import cp_model
-import sys
+from typing import Dict, List, Tuple
 
-# ============================================================================
-# STRUCTURES DE DONNÉES POUR LES INSTANCES
-# ============================================================================
+# ==============================================================================
+# STRUCTURES DE DONNÉES
+# ==============================================================================
 
 @dataclass
 class Vehicle:
     id: int
-    capacity: float
-    home_garage: int
+    capacity: int
     initial_product: int
+    garage_id: int
 
 @dataclass
 class Depot:
     id: int
     x: float
     y: float
-    stocks: List[float]  # stock pour chaque produit
+    stocks: List[int]
 
 @dataclass
 class Garage:
@@ -43,842 +48,813 @@ class Station:
     id: int
     x: float
     y: float
-    demands: List[float]  # demande pour chaque produit
+    demands: List[int]
 
-@dataclass
-class Instance:
-    """Représente une instance complète du problème MPVRP-CC"""
-    uuid: str
-    nb_products: int
-    nb_depots: int
-    nb_garages: int
-    nb_stations: int
-    nb_vehicles: int
-    transition_cost: List[List[float]]  # matrice carrée nb_products x nb_products
-    vehicles: List[Vehicle]
-    depots: List[Depot]
-    garages: List[Garage]
-    stations: List[Station]
-    
-    def __post_init__(self):
-        # Créer des dictionnaires pour un accès rapide
-        self.depot_dict = {d.id: d for d in self.depots}
-        self.garage_dict = {g.id: g for g in self.garages}
-        self.station_dict = {s.id: s for s in self.stations}
-        self.vehicle_dict = {v.id: v for v in self.vehicles}
 
-# ============================================================================
-# LECTURE DES INSTANCES
-# ============================================================================
+# ==============================================================================
+# CLASSE INSTANCE
+# ==============================================================================
 
-def read_instance(file_path: str) -> Instance:
-    """
-    Lit un fichier d'instance au format spécifié.
+class MPVRPInstance:
+    """Gère le chargement des données"""
     
-    Format:
-    Ligne 1: UUID
-    Ligne 2: NbProducts NbDepots NbGarages NbStations NbVehicles
-    Matrice de coût de transition (NbProducts lignes, NbProducts valeurs par ligne)
-    Véhicules (NbVehicles lignes: ID Capacity HomeGarage InitialProduct)
-    Dépôts (NbDepots lignes: ID X Y Stock_P1 Stock_P2 ... Stock_Pp)
-    Garages (NbGarages lignes: ID X Y)
-    Stations (NbStations lignes: ID X Y Demand_P1 Demand_P2 ... Demand_Pp)
-    """
-    with open(file_path, 'r') as f:
-        lines = [line.strip() for line in f.readlines()]
+    def __init__(self, filename: str):
+        self.filename = filename
+        self.nP = 0
+        self.nK = 0
+        self.nG = 0
+        self.nD = 0
+        self.nS = 0
+        
+        self.vehicles: List[Vehicle] = []
+        self.depots: List[Depot] = []
+        self.garages: List[Garage] = []
+        self.stations: List[Station] = []
+        
+        self.C: Dict[Tuple[int, int], float] = {}  # Distances Cij
+        self.changeover_costs: List[List[float]] = []  # Cp1p2
+        
+        self.load_instance(filename)
     
-    # Nettoyer les lignes vides et les commentaires
-    cleaned_lines = []
-    for line in lines:
-        if line and not line.startswith('#'):
-            # Supprimer les commentaires en ligne
-            if '#' in line:
-                line = line.split('#')[0].strip()
-            cleaned_lines.append(line)
-    
-    lines = cleaned_lines
-    
-    # UUID (ligne 1)
-    instance_uuid = lines[0]
-    
-    # Paramètres globaux (ligne 2)
-    params = list(map(int, lines[1].split()))
-    if len(params) != 5:
-        raise ValueError(f"Ligne 2 doit avoir 5 valeurs, trouvé {len(params)}")
-    
-    nb_products, nb_depots, nb_garages, nb_stations, nb_vehicles = params
-    
-    # Indice de lecture courant
-    idx = 2
-    
-    # Lire la matrice de coût de transition
-    transition_cost = []
-    for i in range(nb_products):
-        row = list(map(float, lines[idx].split()))
-        if len(row) != nb_products:
-            raise ValueError(f"La matrice de transition doit être carrée ({nb_products}x{nb_products})")
-        transition_cost.append(row)
+    def load_instance(self, filename: str):
+        """Charge l'instance"""
+        print(f" Chargement: {filename}")
+        
+        with open(filename, 'r') as f:
+            lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+        
+        idx = 0
+        
+        # Paramètres
+        params = list(map(int, lines[idx].split()))
+        self.nP, self.nG, self.nD, self.nS, self.nK = params
         idx += 1
+        
+        print(f"  Produits: {self.nP} | Camions: {self.nK}")
+        print(f"  Garages: {self.nG} | Dépôts: {self.nD} | Stations: {self.nS}")
+        
+        # Coûts de changement Cp1p2
+        for i in range(self.nP):
+            row = list(map(float, lines[idx].split()))
+            self.changeover_costs.append(row)
+            idx += 1
+        
+        # Véhicules
+        for _ in range(self.nK):
+            parts = list(map(int, lines[idx].split()))
+            self.vehicles.append(Vehicle(*parts))
+            idx += 1
+        
+        # Dépôts
+        for _ in range(self.nD):
+            parts = lines[idx].split()
+            depot_id = int(parts[0])
+            x, y = float(parts[1]), float(parts[2])
+            stocks = list(map(int, parts[3:]))
+            self.depots.append(Depot(depot_id, x, y, stocks))
+            idx += 1
+        
+        # Garages
+        for _ in range(self.nG):
+            parts = lines[idx].split()
+            garage_id = int(parts[0])
+            x, y = float(parts[1]), float(parts[2])
+            self.garages.append(Garage(garage_id, x, y))
+            idx += 1
+        
+        # Stations
+        for _ in range(self.nS):
+            parts = lines[idx].split()
+            station_id = int(parts[0])
+            x, y = float(parts[1]), float(parts[2])
+            demands = list(map(int, parts[3:]))
+            self.stations.append(Station(station_id, x, y, demands))
+            idx += 1
+        
+        # Debug: afficher les IDs
+        print(f"\n   Debug:")
+        print(f"     Garages IDs: {[g.id for g in self.garages]}")
+        print(f"     Véhicules garage_id: {[v.garage_id for v in self.vehicles]}")
+        
+        # Calcul distances Cij
+        self._compute_distances()
+        print(f"   Instance chargée")
     
-    # Lire les véhicules
-    vehicles = []
-    for i in range(nb_vehicles):
-        parts = lines[idx].split()
-        if len(parts) < 4:
-            raise ValueError(f"Ligne véhicule {i+1} doit avoir au moins 4 valeurs")
+    def _compute_distances(self):
+        """Calcule la matrice Cij (distances euclidiennes)"""
+        all_nodes = {}
         
-        vehicle_id = int(parts[0])
-        capacity = float(parts[1])
-        home_garage = int(parts[2])
-        initial_product = int(parts[3])
+        for g in self.garages:
+            all_nodes[('G', g.id)] = (g.x, g.y)
+        for d in self.depots:
+            all_nodes[('D', d.id)] = (d.x, d.y)
+        for s in self.stations:
+            all_nodes[('S', s.id)] = (s.x, s.y)
         
-        vehicles.append(Vehicle(vehicle_id, capacity, home_garage, initial_product))
-        idx += 1
+        for (t1, id1), (x1, y1) in all_nodes.items():
+            for (t2, id2), (x2, y2) in all_nodes.items():
+                dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+                self.C[(t1, id1, t2, id2)] = dist
     
-    # Lire les dépôts
-    depots = []
-    for i in range(nb_depots):
-        parts = list(map(float, lines[idx].split()))
-        if len(parts) < 3 + nb_products:
-            raise ValueError(f"Dépôt {i+1} doit avoir {3 + nb_products} valeurs")
-        
-        depot_id = int(parts[0])
-        x = parts[1]
-        y = parts[2]
-        stocks = parts[3:3 + nb_products]
-        
-        depots.append(Depot(depot_id, x, y, stocks))
-        idx += 1
-    
-    # Lire les garages
-    garages = []
-    for i in range(nb_garages):
-        parts = list(map(float, lines[idx].split()))
-        if len(parts) < 3:
-            raise ValueError(f"Garage {i+1} doit avoir 3 valeurs")
-        
-        garage_id = int(parts[0])
-        x = parts[1]
-        y = parts[2]
-        
-        garages.append(Garage(garage_id, x, y))
-        idx += 1
-    
-    # Lire les stations
-    stations = []
-    for i in range(nb_stations):
-        parts = list(map(float, lines[idx].split()))
-        if len(parts) < 3 + nb_products:
-            raise ValueError(f"Station {i+1} doit avoir {3 + nb_products} valeurs")
-        
-        station_id = int(parts[0])
-        x = parts[1]
-        y = parts[2]
-        demands = parts[3:3 + nb_products]
-        
-        stations.append(Station(station_id, x, y, demands))
-        idx += 1
-    
-    return Instance(
-        uuid=instance_uuid,
-        nb_products=nb_products,
-        nb_depots=nb_depots,
-        nb_garages=nb_garages,
-        nb_stations=nb_stations,
-        nb_vehicles=nb_vehicles,
-        transition_cost=transition_cost,
-        vehicles=vehicles,
-        depots=depots,
-        garages=garages,
-        stations=stations
-    )
+    def get_distance(self, type1: str, id1: int, type2: str, id2: int) -> float:
+        """Retourne Cij"""
+        return self.C.get((type1, id1, type2, id2), 0.0)
 
-# ============================================================================
-# MODÈLE MPVRP-CC AVEC OR-TOOLS
-# ============================================================================
+
+# ==============================================================================
+# SOLVEUR MILP
+# ==============================================================================
 
 class MPVRPSolver:
-    """Solveur pour le problème MPVRP-CC utilisant OR-Tools CP-SAT."""
+    """Solveur basé sur la modélisation officielle"""
     
-    def __init__(self, instance: Instance, time_limit_seconds: int = 300):
+    def __init__(self, instance: MPVRPInstance, time_limit: int = 300):
         self.instance = instance
-        self.time_limit = time_limit_seconds
+        self.time_limit = time_limit
+        self.start_time = time_module.time()
         
-        # Modèle CP-SAT
-        self.model = cp_model.CpModel()
-        self.solver = cp_model.CpSolver()
+        print("\n Initialisation SCIP...")
+        self.solver = pywraplp.Solver.CreateSolver('SCIP')
+        if not self.solver:
+            raise RuntimeError(" Solver indisponible")
         
-        # Configurer le solveur
-        self.solver.parameters.max_time_in_seconds = time_limit_seconds
-        self.solver.parameters.num_search_workers = 8
-        
-        # Structures pour le modèle
-        self._setup_nodes()
-        self._create_variables()
-        self._add_constraints()
-        self._set_objective()
+        # Variables selon la modélisation
+        self.X = {}      # Xijk : routage
+        self.t = {}      # tp1p2 : changement
+        self.f = {}      # f^p_ijk : flux
     
-    def _setup_nodes(self):
-        """Prépare la liste de tous les nœuds avec leurs types."""
-        self.all_nodes = []
-        self.node_types = {}  # 'G', 'D', 'S'
-        self.node_coords = {}  # (x, y)
-        self.node_indices = {}  # nom -> index
-        self.reverse_indices = {}  # index -> nom
+    def build_model(self):
+        """Construit le modèle selon la modélisation officielle"""
+        print("\n" + "="*70)
+        print("CONSTRUCTION DU MODÈLE")
+        print("="*70)
         
-        index = 0
+        self._create_variables()
+        self._set_objective()
+        self._add_constraints()
         
-        # Ajouter les garages
-        for garage in self.instance.garages:
-            node_id = f"G{garage.id}"
-            self.all_nodes.append(node_id)
-            self.node_types[node_id] = 'G'
-            self.node_coords[node_id] = (garage.x, garage.y)
-            self.node_indices[node_id] = index
-            self.reverse_indices[index] = node_id
-            index += 1
-        
-        # Ajouter les dépôts
-        for depot in self.instance.depots:
-            node_id = f"D{depot.id}"
-            self.all_nodes.append(node_id)
-            self.node_types[node_id] = 'D'
-            self.node_coords[node_id] = (depot.x, depot.y)
-            self.node_indices[node_id] = index
-            self.reverse_indices[index] = node_id
-            index += 1
-        
-        # Ajouter les stations
-        for station in self.instance.stations:
-            node_id = f"S{station.id}"
-            self.all_nodes.append(node_id)
-            self.node_types[node_id] = 'S'
-            self.node_coords[node_id] = (station.x, station.y)
-            self.node_indices[node_id] = index
-            self.reverse_indices[index] = node_id
-            index += 1
-        
-        self.nb_nodes = len(self.all_nodes)
-        
-        # Pré-calculer les distances
-        self.distances = {}
-        for i in range(self.nb_nodes):
-            for j in range(self.nb_nodes):
-                if i != j:
-                    node_i = self.reverse_indices[i]
-                    node_j = self.reverse_indices[j]
-                    x1, y1 = self.node_coords[node_i]
-                    x2, y2 = self.node_coords[node_j]
-                    dist = math.sqrt((x1 - x2)**2 + (y1 - y2)**2)
-                    self.distances[(i, j)] = dist
+        print(f"\n Modèle construit")
+        print(f"  Variables   : {self.solver.NumVariables()}")
+        print(f"  Contraintes : {self.solver.NumConstraints()}")
+        print("="*70)
     
     def _create_variables(self):
-        """Crée toutes les variables du modèle."""
-        # Variables binaires X_ijk (véhicule k va de i à j)
-        self.x_vars = {}
-        for i in range(self.nb_nodes):
-            for j in range(self.nb_nodes):
-                if i != j:
-                    for k in range(self.instance.nb_vehicles):
-                        var_name = f"X_{i}_{j}_{k}"
-                        self.x_vars[(i, j, k)] = self.model.NewBoolVar(var_name)
+        """Crée les variables"""
+        print("\n Création des variables...")
+        inst = self.instance
         
-        # Variables de flux f_ijkp (quantité de produit p transportée de i à j par k)
-        self.f_vars = {}
-        for i in range(self.nb_nodes):
-            for j in range(self.nb_nodes):
-                if i != j:
-                    for k in range(self.instance.nb_vehicles):
-                        vehicle_capacity = self.instance.vehicles[k].capacity
-                        for p in range(self.instance.nb_products):
-                            var_name = f"f_{i}_{j}_{k}_{p}"
-                            self.f_vars[(i, j, k, p)] = self.model.NewIntVar(
-                                0, int(vehicle_capacity), var_name)
+        # Variables Xijk
+        print("   Xijk...", end='', flush=True)
+        count = 0
         
-        # Variables de changement de produit t_p1p2k
-        self.t_vars = {}
-        for p1 in range(self.instance.nb_products):
-            for p2 in range(self.instance.nb_products):
-                if p1 != p2:  # Pas de coût pour rester sur le même produit
-                    for k in range(self.instance.nb_vehicles):
-                        var_name = f"t_{p1}_{p2}_{k}"
-                        self.t_vars[(p1, p2, k)] = self.model.NewBoolVar(var_name)
-        
-        # Variables pour le produit courant dans chaque véhicule à chaque nœud
-        self.current_product_vars = {}
-        for k in range(self.instance.nb_vehicles):
-            for i in range(self.nb_nodes):
-                var_name = f"current_prod_{k}_{i}"
-                self.current_product_vars[(k, i)] = self.model.NewIntVar(
-                    0, self.instance.nb_products - 1, var_name)
-    
-    def _add_constraints(self):
-        """Ajoute toutes les contraintes du modèle."""
-        # 1. Contrainte de continuité du trafic
-        for k in range(self.instance.nb_vehicles):
-            for i in range(self.nb_nodes):
-                node_type = self.node_types[self.reverse_indices[i]]
-                if node_type in ['S', 'D']:  # Pour les stations et dépôts
-                    incoming = []
-                    outgoing = []
-                    
-                    for j in range(self.nb_nodes):
-                        if i != j:
-                            incoming.append(self.x_vars[(j, i, k)])
-                            outgoing.append(self.x_vars[(i, j, k)])
-                    
-                    if incoming:  # S'il y a des arcs possibles
-                        self.model.Add(sum(incoming) == sum(outgoing))
-        
-        # 2. Livraisons obligatoires (chaque station doit être visitée au moins une fois)
-        station_indices = [i for i in range(self.nb_nodes) 
-                          if self.node_types[self.reverse_indices[i]] == 'S']
-        
-        for station_idx in station_indices:
-            incoming_arcs = []
-            for k in range(self.instance.nb_vehicles):
-                for i in range(self.nb_nodes):
-                    if i != station_idx:
-                        incoming_arcs.append(self.x_vars[(i, station_idx, k)])
+        for k in inst.vehicles:
+            # Vérifier que le garage existe
+            garage_exists = any(g.id == k.garage_id for g in inst.garages)
+            if not garage_exists:
+                continue
             
-            if incoming_arcs:
-                self.model.Add(sum(incoming_arcs) >= 1)
-        
-        # 3. Satisfaction de la demande
-        for station in self.instance.stations:
-            station_node = f"S{station.id}"
-            if station_node in self.node_indices:
-                station_idx = self.node_indices[station_node]
-                
-                for p in range(self.instance.nb_products):
-                    if station.demands[p] > 0:
-                        # Flux entrant - flux sortant = demande
-                        incoming_flow = []
-                        outgoing_flow = []
-                        
-                        for k in range(self.instance.nb_vehicles):
-                            for i in range(self.nb_nodes):
-                                if i != station_idx:
-                                    incoming_flow.append(self.f_vars[(i, station_idx, k, p)])
-                                    outgoing_flow.append(self.f_vars[(station_idx, i, k, p)])
-                        
-                        if incoming_flow:
-                            demand_value = int(station.demands[p])
-                            self.model.Add(sum(incoming_flow) - sum(outgoing_flow) == demand_value)
-        
-        # 4. Contraintes de flux pour les garages
-        for k, vehicle in enumerate(self.instance.vehicles):
-            garage_node = f"G{vehicle.home_garage}"
-            if garage_node in self.node_indices:
-                garage_idx = self.node_indices[garage_node]
-                
-                # Flux sortant du garage (vers les dépôts)
-                outgoing_from_garage = []
-                for j in range(self.nb_nodes):
-                    if j != garage_idx and self.node_types[self.reverse_indices[j]] == 'D':
-                        outgoing_from_garage.append(self.x_vars[(garage_idx, j, k)])
-                
-                if outgoing_from_garage:
-                    self.model.Add(sum(outgoing_from_garage) <= 1)
-                
-                # Flux entrant au garage (depuis les stations)
-                incoming_to_garage = []
-                for i in range(self.nb_nodes):
-                    if i != garage_idx and self.node_types[self.reverse_indices[i]] == 'S':
-                        incoming_to_garage.append(self.x_vars[(i, garage_idx, k)])
-                
-                if incoming_to_garage:
-                    self.model.Add(sum(incoming_to_garage) <= 1)
-                
-                # Nombre de sorties = nombre d'entrées
-                if outgoing_from_garage and incoming_to_garage:
-                    self.model.Add(sum(outgoing_from_garage) == sum(incoming_to_garage))
-        
-        # 5. Contraintes de capacité
-        for k, vehicle in enumerate(self.instance.vehicles):
-            vehicle_capacity = vehicle.capacity
+            # Garage → Dépôt
+            for g in inst.garages:
+                if g.id == k.garage_id:
+                    for d in inst.depots:
+                        var_name = f'X_G{g.id}_D{d.id}_{k.id}'
+                        self.X[('G', g.id, 'D', d.id, k.id)] = self.solver.BoolVar(var_name)
+                        count += 1
             
-            for i in range(self.nb_nodes):
-                for j in range(self.nb_nodes):
-                    if i != j:
-                        # La somme des produits transportés sur cet arc doit être <= capacité
-                        flow_vars = [self.f_vars[(i, j, k, p)] for p in range(self.instance.nb_products)]
-                        if flow_vars:
-                            self.model.Add(sum(flow_vars) <= int(vehicle_capacity) * self.x_vars[(i, j, k)])
+            # Dépôt → Station
+            for d in inst.depots:
+                for s in inst.stations:
+                    var_name = f'X_D{d.id}_S{s.id}_{k.id}'
+                    self.X[('D', d.id, 'S', s.id, k.id)] = self.solver.BoolVar(var_name)
+                    count += 1
+            
+            # Station → Station
+            for s1 in inst.stations:
+                for s2 in inst.stations:
+                    if s1.id != s2.id:
+                        var_name = f'X_S{s1.id}_S{s2.id}_{k.id}'
+                        self.X[('S', s1.id, 'S', s2.id, k.id)] = self.solver.BoolVar(var_name)
+                        count += 1
+            
+            # Station → Garage
+            for s in inst.stations:
+                for g in inst.garages:
+                    if g.id == k.garage_id:
+                        var_name = f'X_S{s.id}_G{g.id}_{k.id}'
+                        self.X[('S', s.id, 'G', g.id, k.id)] = self.solver.BoolVar(var_name)
+                        count += 1
         
-        # 6. Contraintes liées aux dépôts
-        depot_indices = [i for i in range(self.nb_nodes) 
-                        if self.node_types[self.reverse_indices[i]] == 'D']
+        print(f" {count}")
         
-        for depot_idx in depot_indices:
-            for k in range(self.instance.nb_vehicles):
-                for p in range(self.instance.nb_products):
-                    # Flux sortant >= flux entrant (on charge au dépôt)
-                    incoming_flow = []
-                    outgoing_flow = []
-                    
-                    for i in range(self.nb_nodes):
-                        if i != depot_idx:
-                            incoming_flow.append(self.f_vars[(i, depot_idx, k, p)])
-                            outgoing_flow.append(self.f_vars[(depot_idx, i, k, p)])
-                    
-                    if incoming_flow and outgoing_flow:
-                        self.model.Add(sum(outgoing_flow) >= sum(incoming_flow))
+        # Variables tp1p2
+        print("   tp1p2...", end='', flush=True)
+        count = 0
+        for p1 in range(inst.nP):
+            for p2 in range(inst.nP):
+                if p1 != p2:
+                    self.t[(p1, p2)] = self.solver.BoolVar(f't_{p1}_{p2}')
+                    count += 1
+        print(f" {count}")
         
-        # 7. Contraintes de trafic interdites
-        # Pas de garage -> station
-        garage_indices = [i for i in range(self.nb_nodes) 
-                         if self.node_types[self.reverse_indices[i]] == 'G']
-        station_indices = [i for i in range(self.nb_nodes) 
-                          if self.node_types[self.reverse_indices[i]] == 'S']
+        # Variables f^p_ijk
+        print("   f^p_ijk...", end='', flush=True)
+        count = 0
         
-        for garage_idx in garage_indices:
-            for station_idx in station_indices:
-                for k in range(self.instance.nb_vehicles):
-                    self.model.Add(self.x_vars[(garage_idx, station_idx, k)] == 0)
+        for k in inst.vehicles:
+            # Vérifier que le garage existe
+            garage_exists = any(g.id == k.garage_id for g in inst.garages)
+            if not garage_exists:
+                continue
+            
+            for p in range(inst.nP):
+                # Dépôt → Station
+                for d in inst.depots:
+                    for s in inst.stations:
+                        var_name = f'f{p}_D{d.id}_S{s.id}_{k.id}'
+                        self.f[(p, 'D', d.id, 'S', s.id, k.id)] = \
+                            self.solver.NumVar(0, k.capacity, var_name)
+                        count += 1
+                
+                # Station → Station
+                for s1 in inst.stations:
+                    for s2 in inst.stations:
+                        if s1.id != s2.id:
+                            var_name = f'f{p}_S{s1.id}_S{s2.id}_{k.id}'
+                            self.f[(p, 'S', s1.id, 'S', s2.id, k.id)] = \
+                                self.solver.NumVar(0, k.capacity, var_name)
+                            count += 1
         
-        # Pas de dépôt -> garage
-        depot_indices = [i for i in range(self.nb_nodes) 
-                        if self.node_types[self.reverse_indices[i]] == 'D']
-        
-        for depot_idx in depot_indices:
-            for garage_idx in garage_indices:
-                for k in range(self.instance.nb_vehicles):
-                    self.model.Add(self.x_vars[(depot_idx, garage_idx, k)] == 0)
-        
-        # Pas de dépôt -> dépôt
-        for depot1_idx in depot_indices:
-            for depot2_idx in depot_indices:
-                if depot1_idx != depot2_idx:
-                    for k in range(self.instance.nb_vehicles):
-                        self.model.Add(self.x_vars[(depot1_idx, depot2_idx, k)] == 0)
-        
-        # 8. Contraintes sur les changements de produit
-        # Un véhicule ne peut transporter qu'un seul produit à la fois
-        for k in range(self.instance.nb_vehicles):
-            for i in range(self.nb_nodes):
-                for j in range(self.nb_nodes):
-                    if i != j:
-                        # Variables indicatrices pour chaque produit sur cet arc
-                        product_vars = []
-                        for p in range(self.instance.nb_products):
-                            # Variable binaire indiquant si le produit p est transporté sur cet arc
-                            prod_var = self.model.NewBoolVar(f"prod_{i}_{j}_{k}_{p}")
-                            # Si f_ijkp > 0, alors prod_var = 1
-                            self.model.Add(self.f_vars[(i, j, k, p)] > 0).OnlyEnforceIf(prod_var)
-                            self.model.Add(self.f_vars[(i, j, k, p)] == 0).OnlyEnforceIf(prod_var.Not())
-                            product_vars.append(prod_var)
-                        
-                        # Au plus un produit transporté sur cet arc
-                        if product_vars:
-                            self.model.Add(sum(product_vars) <= 1)
+        print(f" {count}")
     
     def _set_objective(self):
-        """Définit la fonction objectif à minimiser."""
-        # Terme de distance
-        distance_terms = []
-        for i in range(self.nb_nodes):
-            for j in range(self.nb_nodes):
-                if i != j:
-                    for k in range(self.instance.nb_vehicles):
-                        if (i, j) in self.distances:
-                            # Multiplier par 100 pour éviter les problèmes de précision avec les flottants
-                            coeff = int(self.distances[(i, j)] * 100)
-                            distance_terms.append(coeff * self.x_vars[(i, j, k)])
+        """Fonction objectif"""
+        print("\n Fonction objectif...")
+        inst = self.instance
+        objective = self.solver.Objective()
         
-        # Terme de coût de transition
-        transition_terms = []
-        for p1 in range(self.instance.nb_products):
-            for p2 in range(self.instance.nb_products):
-                if p1 != p2:
-                    cost = self.instance.transition_cost[p1][p2]
-                    for k in range(self.instance.nb_vehicles):
-                        coeff = int(cost * 100)
-                        transition_terms.append(coeff * self.t_vars[(p1, p2, k)])
+        # Coût transport
+        for key, var in self.X.items():
+            t1, id1, t2, id2, k_id = key
+            dist = inst.get_distance(t1, id1, t2, id2)
+            objective.SetCoefficient(var, dist)
         
-        # Minimiser la somme
-        if distance_terms or transition_terms:
-            self.model.Minimize(sum(distance_terms) + sum(transition_terms))
+        # Coût changement
+        for key, var in self.t.items():
+            p1, p2 = key
+            cost = inst.changeover_costs[p1][p2]
+            objective.SetCoefficient(var, cost)
+        
+        objective.SetMinimization()
+        print("  ✓ min(Transport + Changement)")
+    
+    def _add_constraints(self):
+        """Ajoute les contraintes"""
+        print("\n⚖️  Contraintes...")
+        
+        self._constraint_continuity()
+        self._constraint_mandatory_delivery()
+        self._constraint_demand_satisfaction()
+        self._constraint_flow()
+        self._constraint_capacity()
+        self._constraint_depot_capacity()
+        self._constraint_no_subtours()  # NOUVELLE contrainte
+    
+    def _constraint_no_subtours(self):
+        """Empêche les sous-tours avec contraintes fortes"""
+        print("  7  Élimination sous-tours...", end='', flush=True)
+        inst = self.instance
+        count = 0
+        
+        # CONTRAINTE FORTE : Pour chaque véhicule
+        # La somme des arcs S→S ne peut PAS être >= nb_stations
+        # (sinon c'est un cycle complet sans garage/dépôt)
+        for k in inst.vehicles:
+            garage = None
+            for g in inst.garages:
+                if g.id == k.garage_id:
+                    garage = g
+                    break
+            
+            if garage is None:
+                continue
+            
+            # Contrainte 1 : Si on a des arcs S→S, on DOIT avoir G→D
+            c = self.solver.Constraint(-self.solver.infinity(), 0)
+            
+            # Compter les arcs S→S
+            for s1 in inst.stations:
+                for s2 in inst.stations:
+                    if s1.id != s2.id:
+                        key = ('S', s1.id, 'S', s2.id, k.id)
+                        if key in self.X:
+                            c.SetCoefficient(self.X[key], 1)
+            
+            # On DOIT avoir au moins un départ du garage
+            for d in inst.depots:
+                key = ('G', garage.id, 'D', d.id, k.id)
+                if key in self.X:
+                    c.SetCoefficient(self.X[key], -100)  # Très grand pour forcer
+            
+            count += 1
+            
+            # Contrainte 2 : Pour chaque station visitée, il DOIT y avoir
+            # un arc D→Station quelque part
+            for s in inst.stations:
+                c = self.solver.Constraint(-self.solver.infinity(), 0)
+                
+                # Si cette station est visitée (arcs sortants)
+                for s2 in inst.stations:
+                    if s2.id != s.id:
+                        key = ('S', s.id, 'S', s2.id, k.id)
+                        if key in self.X:
+                            c.SetCoefficient(self.X[key], 1)
+                
+                for g in inst.garages:
+                    key = ('S', s.id, 'G', g.id, k.id)
+                    if key in self.X:
+                        c.SetCoefficient(self.X[key], 1)
+                
+                # Il DOIT y avoir un arc D→Station ou S→Station entrant
+                for d in inst.depots:
+                    key = ('D', d.id, 'S', s.id, k.id)
+                    if key in self.X:
+                        c.SetCoefficient(self.X[key], -1)
+                
+                for s2 in inst.stations:
+                    if s2.id != s.id:
+                        key = ('S', s2.id, 'S', s.id, k.id)
+                        if key in self.X:
+                            c.SetCoefficient(self.X[key], -1)
+                
+                count += 1
+        
+        print(f" {count}")
+    
+    def _constraint_continuity(self):
+        """Continuité du trafic"""
+        print("  1  Continuité...", end='', flush=True)
+        inst = self.instance
+        count = 0
+        
+        for k in inst.vehicles:
+            # Pour chaque station
+            for s in inst.stations:
+                c = self.solver.Constraint(0, 0)
+                
+                # Entrant
+                for d in inst.depots:
+                    key = ('D', d.id, 'S', s.id, k.id)
+                    if key in self.X:
+                        c.SetCoefficient(self.X[key], 1)
+                
+                for s2 in inst.stations:
+                    if s2.id != s.id:
+                        key = ('S', s2.id, 'S', s.id, k.id)
+                        if key in self.X:
+                            c.SetCoefficient(self.X[key], 1)
+                
+                # Sortant
+                for s2 in inst.stations:
+                    if s2.id != s.id:
+                        key = ('S', s.id, 'S', s2.id, k.id)
+                        if key in self.X:
+                            c.SetCoefficient(self.X[key], -1)
+                
+                for g in inst.garages:
+                    key = ('S', s.id, 'G', g.id, k.id)
+                    if key in self.X:
+                        c.SetCoefficient(self.X[key], -1)
+                
+                count += 1
+            
+            # Pour chaque dépôt
+            for d in inst.depots:
+                c = self.solver.Constraint(0, 0)
+                
+                # Entrant
+                for g in inst.garages:
+                    key = ('G', g.id, 'D', d.id, k.id)
+                    if key in self.X:
+                        c.SetCoefficient(self.X[key], 1)
+                
+                # Sortant
+                for s in inst.stations:
+                    key = ('D', d.id, 'S', s.id, k.id)
+                    if key in self.X:
+                        c.SetCoefficient(self.X[key], -1)
+                
+                count += 1
+        
+        print(f" {count}")
+    
+    def _constraint_mandatory_delivery(self):
+        """Livraisons obligatoires"""
+        print("  2  Livraisons...", end='', flush=True)
+        inst = self.instance
+        count = 0
+        
+        # Sortantes
+        for s in inst.stations:
+            c = self.solver.Constraint(1, self.solver.infinity())
+            for k in inst.vehicles:
+                for s2 in inst.stations:
+                    if s2.id != s.id:
+                        key = ('S', s.id, 'S', s2.id, k.id)
+                        if key in self.X:
+                            c.SetCoefficient(self.X[key], 1)
+                for g in inst.garages:
+                    key = ('S', s.id, 'G', g.id, k.id)
+                    if key in self.X:
+                        c.SetCoefficient(self.X[key], 1)
+            count += 1
+        
+        # Entrantes
+        for s in inst.stations:
+            c = self.solver.Constraint(1, self.solver.infinity())
+            for k in inst.vehicles:
+                for d in inst.depots:
+                    key = ('D', d.id, 'S', s.id, k.id)
+                    if key in self.X:
+                        c.SetCoefficient(self.X[key], 1)
+                for s2 in inst.stations:
+                    if s2.id != s.id:
+                        key = ('S', s2.id, 'S', s.id, k.id)
+                        if key in self.X:
+                            c.SetCoefficient(self.X[key], 1)
+            count += 1
+        
+        print(f" {count}")
+    
+    def _constraint_demand_satisfaction(self):
+        """Satisfaction de la demande : Bps"""
+        print("  3  Demande...", end='', flush=True)
+        inst = self.instance
+        count = 0
+        
+        for s in inst.stations:
+            for p in range(inst.nP):
+                if s.demands[p] == 0:
+                    continue
+                
+                c = self.solver.Constraint(s.demands[p], s.demands[p])
+                
+                for k in inst.vehicles:
+                    # Flux entrant
+                    for d in inst.depots:
+                        key_f = (p, 'D', d.id, 'S', s.id, k.id)
+                        if key_f in self.f:
+                            c.SetCoefficient(self.f[key_f], 1)
+                    
+                    for s2 in inst.stations:
+                        if s2.id != s.id:
+                            key_f = (p, 'S', s2.id, 'S', s.id, k.id)
+                            if key_f in self.f:
+                                c.SetCoefficient(self.f[key_f], 1)
+                    
+                    # Flux sortant
+                    for s2 in inst.stations:
+                        if s2.id != s.id:
+                            key_f = (p, 'S', s.id, 'S', s2.id, k.id)
+                            if key_f in self.f:
+                                c.SetCoefficient(self.f[key_f], -1)
+                
+                count += 1
+        
+        print(f" {count}")
+    
+    def _constraint_flow(self):
+        """Flux des camions (garage d'origine)"""
+        print("  4 Flux...", end='', flush=True)
+        inst = self.instance
+        count = 0
+        
+        for k in inst.vehicles:
+            garage = None
+            for g in inst.garages:
+                if g.id == k.garage_id:
+                    garage = g
+                    break
+            
+            if garage is None:
+                continue
+            
+            # Contrainte : sortie du garage = entrée au garage
+            c = self.solver.Constraint(0, 0)
+            
+            for d in inst.depots:
+                key = ('G', garage.id, 'D', d.id, k.id)
+                if key in self.X:
+                    c.SetCoefficient(self.X[key], 1)
+            
+            for s in inst.stations:
+                key = ('S', s.id, 'G', garage.id, k.id)
+                if key in self.X:
+                    c.SetCoefficient(self.X[key], -1)
+            
+            count += 1
+        
+        print(f" {count}")
+    
+    def _constraint_capacity(self):
+        """Capacité : 0 ≤ f^p_ijk ≤ Qk.Xijk"""
+        print("  5  Capacité...", end='', flush=True)
+        inst = self.instance
+        count = 0
+        
+        for key_f, var_f in self.f.items():
+            p, t1, id1, t2, id2, k_id = key_f
+            key_x = (t1, id1, t2, id2, k_id)
+            
+            if key_x in self.X:
+                vehicle = next(v for v in inst.vehicles if v.id == k_id)
+                
+                c = self.solver.Constraint(-self.solver.infinity(), 0)
+                c.SetCoefficient(var_f, 1)
+                c.SetCoefficient(self.X[key_x], -vehicle.capacity)
+                count += 1
+        
+        print(f" {count}")
+    
+    def _constraint_depot_capacity(self):
+        """Capacité dépôts"""
+        print("  6  Dépôts...", end='', flush=True)
+        inst = self.instance
+        count = 0
+        
+        for d in inst.depots:
+            for k in inst.vehicles:
+                for p in range(inst.nP):
+                    c = self.solver.Constraint(0, self.solver.infinity())
+                    
+                    # Sortie
+                    for s in inst.stations:
+                        key = (p, 'D', d.id, 'S', s.id, k.id)
+                        if key in self.f:
+                            c.SetCoefficient(self.f[key], 1)
+                    
+                    count += 1
+        
+        print(f" {count}")
     
     def solve(self):
-        """Résout le modèle et retourne une solution."""
-        print(f"Début de la résolution...")
-        print(f"Nombre de nœuds: {self.nb_nodes}")
-        print(f"Nombre de véhicules: {self.instance.nb_vehicles}")
-        print(f"Limite de temps: {self.time_limit} secondes")
+        """Résout"""
+        print("\n" + "="*70)
+        print("RÉSOLUTION")
+        print("="*70)
         
-        start_time = time.time()
-        status = self.solver.Solve(self.model)
-        solving_time = time.time() - start_time
+        self.solver.SetTimeLimit(self.time_limit * 1000)
+        status = self.solver.Solve()
         
-        if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-            status_str = "OPTIMAL" if status == cp_model.OPTIMAL else "FAISABLE"
-            print(f"Solution {status_str} trouvée en {solving_time:.2f} secondes")
-            
-            # Extraire la solution
-            solution = self._extract_solution(solving_time)
-            return solution
+        elapsed = time_module.time() - self.start_time
+        
+        print()
+        if status == pywraplp.Solver.OPTIMAL:
+            print(" SOLUTION OPTIMALE")
+        elif status == pywraplp.Solver.FEASIBLE:
+            print(" SOLUTION RÉALISABLE")
         else:
-            print("Aucune solution trouvée")
+            print(" AUCUNE SOLUTION")
             return None
+        
+        print(f" Coût : {self.solver.Objective().Value():.2f}")
+        print(f"⏱  Temps : {elapsed:.3f}s")
+        print("="*70)
+        
+        return self.extract_solution(elapsed)
     
-    def _extract_solution(self, solving_time):
-        """Extrait la solution du modèle résolu."""
-        from collections import defaultdict
+    def extract_solution(self, elapsed_time):
+        """Extrait la solution"""
+        inst = self.instance
         
-        # Structure pour stocker les routes
-        class RouteInfo:
-            def __init__(self, vehicle_id):
-                self.vehicle_id = vehicle_id
-                self.arcs = []  # Liste de (from, to, product, quantity)
-                self.total_distance = 0.0
-                self.product_changes = 0
-        
-        # Reconstruire les routes pour chaque véhicule
-        routes_by_vehicle = {}
-        
-        for k, vehicle in enumerate(self.instance.vehicles):
-            route = RouteInfo(vehicle.id)
-            
-            # Trouver le départ du véhicule (garage -> dépôt)
-            garage_node = f"G{vehicle.home_garage}"
-            if garage_node in self.node_indices:
-                garage_idx = self.node_indices[garage_node]
-                
-                # Chercher le premier arc sortant du garage
-                for j in range(self.nb_nodes):
-                    if self.solver.Value(self.x_vars[(garage_idx, j, k)]) == 1:
-                        # Suivre la route
-                        current_node = j
-                        prev_node = garage_idx
-                        visited = set()
-                        
-                        while current_node != garage_idx and current_node not in visited:
-                            visited.add(current_node)
-                            
-                            # Trouver le produit transporté sur cet arc
-                            product_on_arc = None
-                            quantity_on_arc = 0
-                            
-                            for p in range(self.instance.nb_products):
-                                qty = self.solver.Value(self.f_vars[(prev_node, current_node, k, p)])
-                                if qty > 0:
-                                    product_on_arc = p
-                                    quantity_on_arc = qty
-                                    break
-                            
-                            if product_on_arc is not None:
-                                from_node = self.reverse_indices[prev_node]
-                                to_node = self.reverse_indices[current_node]
-                                distance = self.distances.get((prev_node, current_node), 0)
-                                
-                                route.arcs.append((from_node, to_node, product_on_arc, quantity_on_arc))
-                                route.total_distance += distance
-                            
-                            # Trouver le prochain nœud
-                            next_node = None
-                            for n in range(self.nb_nodes):
-                                if n != current_node and self.solver.Value(self.x_vars[(current_node, n, k)]) == 1:
-                                    next_node = n
-                                    break
-                            
-                            if next_node is None:
-                                break
-                            
-                            prev_node = current_node
-                            current_node = next_node
-            
-            # Compter les changements de produit
-            if len(route.arcs) > 1:
-                current_product = route.arcs[0][2]  # produit du premier arc
-                for i in range(1, len(route.arcs)):
-                    if route.arcs[i][2] != current_product:
-                        route.product_changes += 1
-                        current_product = route.arcs[i][2]
-            
-            routes_by_vehicle[vehicle.id] = route
-        
-        # Calculer les métriques globales
-        total_distance = sum(r.total_distance for r in routes_by_vehicle.values())
-        total_product_changes = sum(r.product_changes for r in routes_by_vehicle.values())
-        
-        # Calculer le coût total de transition (approximatif)
-        total_transition_cost = 0
-        for (p1, p2, k), var in self.t_vars.items():
-            if self.solver.Value(var) == 1:
-                total_transition_cost += self.instance.transition_cost[p1][p2]
-        
-        # Créer l'objet solution
         solution = {
-            'routes': routes_by_vehicle,
-            'total_distance': total_distance,
-            'total_transition_cost': total_transition_cost,
-            'total_product_changes': total_product_changes,
-            'solving_time': solving_time,
-            'status': 'OPTIMAL' if self.solver.StatusName() == 'OPTIMAL' else 'FEASIBLE'
+            'vehicles_routes': {},
+            'total_distance': 0,
+            'total_changeover': 0,
+            'num_vehicles_used': 0,
+            'num_changeovers': 0,
+            'elapsed_time': elapsed_time
         }
         
-        return solution
-
-# ============================================================================
-# ÉCRITURE DES SOLUTIONS
-# ============================================================================
-
-def write_solution_file(instance, solution, output_path):
-    """
-    Écrit un fichier de solution au format spécifié.
-    
-    Format:
-    Pour chaque véhicule utilisé:
-      Ligne 1: ID : Garage - Dépôt [Qty] - Station (Qty) - ... - Garage
-      Ligne 2: séquence des produits et coûts
-      Ligne vide
-    
-    Puis 6 lignes de métriques:
-      1. Nombre de véhicules utilisés
-      2. Nombre total de changements de produit
-      3. Coût total de transition
-      4. Distance totale
-      5. Modèle du processeur
-      6. Temps de résolution
-    """
-    routes = solution['routes']
-    
-    with open(output_path, 'w') as f:
-        # Écrire les routes pour chaque véhicule
-        for vehicle_id, route in sorted(routes.items()):
-            if not route.arcs:
-                continue  # Véhicule non utilisé
-            
-            # Ligne 1: séquence de visites
-            line1_parts = [f"{vehicle_id}"]
-            
-            # Reconstruire la séquence complète du trajet
-            sequence = []
-            
-            # Ajouter le garage de départ
-            vehicle_obj = instance.vehicle_dict[vehicle_id]
-            sequence.append(str(vehicle_obj.home_garage))
-            
-            # Parcourir les arcs et construire la séquence
-            for from_node, to_node, product, quantity in route.arcs:
-                node_type = from_node[0]  # Premier caractère: G, D ou S
-                node_id = from_node[1:]   # Le reste est l'ID
-                
-                if node_type == 'D' and to_node[0] == 'S':
-                    # Chargement au dépôt
-                    sequence.append(f"{node_id}[{int(quantity)}]")
-                
-                if to_node[0] == 'S':
-                    # Livraison à la station
-                    station_id = to_node[1:]
-                    sequence.append(f"{station_id}({int(quantity)})")
-            
-            # Ajouter le garage de retour
-            sequence.append(str(vehicle_obj.home_garage))
-            
-            # Joindre la séquence
-            line1 = f"{vehicle_id} " + " - ".join(sequence)
-            f.write(line1 + "\n")
-            
-            # Ligne 2: séquence des produits
-            line2_parts = []
-            for _, _, product, _ in route.arcs:
-                line2_parts.append(f"{product}(0,0)")  # Les coûts sont dans les métriques
-            
-            line2 = " ".join(line2_parts)
-            f.write(line2 + "\n\n")
+        # DEBUG : Afficher tous les arcs utilisés
+        print("\n DEBUG - Arcs utilisés dans la solution:")
+        arcs_count = 0
+        for key, var in self.X.items():
+            if var.solution_value() > 0.5:
+                t1, id1, t2, id2, k_id = key
+                dist = inst.get_distance(t1, id1, t2, id2)
+                print(f"  Véhicule {k_id}: {t1}{id1} → {t2}{id2} (dist: {dist:.2f})")
+                solution['total_distance'] += dist
+                arcs_count += 1
         
-        # Écrire les métriques
-        vehicles_used = len([r for r in routes.values() if r.arcs])
-        f.write(f"{vehicles_used}\n")
-        f.write(f"{solution['total_product_changes']}\n")
-        f.write(f"{solution['total_transition_cost']:.2f}\n")
+        print(f"  Total arcs: {arcs_count}")
+        
+        # Changements
+        for key, var in self.t.items():
+            if var.solution_value() > 0.5:
+                p1, p2 = key
+                solution['total_changeover'] += inst.changeover_costs[p1][p2]
+                solution['num_changeovers'] += 1
+                print(f"  Changement: P{p1} → P{p2}")
+        
+        # Extraire routes
+        print("\n DEBUG - Extraction des routes:")
+        for k in inst.vehicles:
+            # Vérifier si ce véhicule est utilisé
+            is_used = False
+            for key, var in self.X.items():
+                if key[4] == k.id and var.solution_value() > 0.5:
+                    is_used = True
+                    break
+            
+            print(f"  Véhicule {k.id}: {'UTILISÉ' if is_used else 'NON UTILISÉ'}")
+            
+            if is_used:
+                route = self._build_route_improved(k)
+                if route and len(route) > 0:
+                    solution['vehicles_routes'][k.id] = route
+                    solution['num_vehicles_used'] += 1
+                    print(f"    → Route extraite avec {len(route)} étapes")
+                else:
+                    print(f"    → ERREUR: Route vide ou None")
+        
+        return solution
+    
+    def _build_route_improved(self, vehicle):
+        """Construit la route d'un véhicule - VERSION AMÉLIORÉE"""
+        inst = self.instance
+        
+        # Collecter tous les arcs utilisés par ce véhicule
+        arcs_used = []
+        for key, var in self.X.items():
+            if var.solution_value() > 0.5:
+                t1, id1, t2, id2, k_id = key
+                if k_id == vehicle.id:
+                    arcs_used.append((t1, id1, t2, id2))
+        
+        if not arcs_used:
+            return None
+        
+        # Reconstruire la séquence à partir du garage
+        route = []
+        current = None
+        
+        # Trouver le départ du garage
+        for arc in arcs_used:
+            if arc[0] == 'G' and arc[1] == vehicle.garage_id:
+                current = arc
+                break
+        
+        if current is None:
+            return None
+        
+        visited = set()
+        
+        while current is not None:
+            t1, id1, t2, id2 = current
+            visited.add(current)
+            
+            # Calculer les quantités pour cet arc
+            quantities = {}
+            for p in range(inst.nP):
+                key_f = (p, t1, id1, t2, id2, vehicle.id)
+                if key_f in self.f:
+                    qty = self.f[key_f].solution_value()
+                    if qty > 0.1:
+                        quantities[p] = qty
+            
+            route.append({
+                'from': (t1, id1),
+                'to': (t2, id2),
+                'quantities': quantities
+            })
+            
+            # Si on est de retour au garage, on s'arrête
+            if t2 == 'G':
+                break
+            
+            # Trouver l'arc suivant
+            next_arc = None
+            for arc in arcs_used:
+                if arc not in visited and arc[0] == t2 and arc[1] == id2:
+                    next_arc = arc
+                    break
+            
+            current = next_arc
+        
+        return route if route else None
+
+
+# ==============================================================================
+# GÉNÉRATION FICHIER SOLUTION
+# ==============================================================================
+
+def write_solution_file(solution: dict, instance: MPVRPInstance, filename: str):
+    """Génère le fichier solution au format officiel"""
+    
+    with open(filename, 'w') as f:
+        # Routes des véhicules
+        for k_id in sorted(solution['vehicles_routes'].keys()):
+            route = solution['vehicles_routes'][k_id]
+            vehicle = next(v for v in instance.vehicles if v.id == k_id)
+            
+            # Ligne 1 : séquence de visites
+            visit_seq = [str(vehicle.garage_id)]
+            
+            for step in route:
+                t_from, id_from = step['from']
+                t_to, id_to = step['to']
+                
+                # Dépôt : [Qty]
+                if t_to == 'D':
+                    total_qty = int(sum(step['quantities'].values())) if step['quantities'] else 0
+                    visit_seq.append(f"{id_to} [{total_qty}]")
+                # Station : (Qty)
+                elif t_to == 'S':
+                    total_qty = int(sum(step['quantities'].values())) if step['quantities'] else 0
+                    visit_seq.append(f"{id_to} ({total_qty})")
+                # Garage
+                elif t_to == 'G':
+                    visit_seq.append(str(id_to))
+            
+            f.write(f"{k_id} " + " - ".join(visit_seq) + "\n")
+            
+            # Ligne 2 : produits et coûts
+            prod_seq = []
+            current_prod = None
+            
+            # Départ du garage
+            if route and route[0]['quantities']:
+                first_prod = list(route[0]['quantities'].keys())[0]
+                prod_seq.append(f"{first_prod}(0.0)")
+                current_prod = first_prod
+            else:
+                prod_seq.append("0(0.0)")
+                current_prod = 0
+            
+            for step in route:
+                if step['quantities']:
+                    prod = list(step['quantities'].keys())[0]
+                    
+                    if prod != current_prod and current_prod is not None:
+                        cost = instance.changeover_costs[current_prod][prod]
+                        prod_seq.append(f"{prod}({cost:.1f})")
+                        current_prod = prod
+                    else:
+                        prod_seq.append(f"{prod}(0.0)")
+                        current_prod = prod
+                else:
+                    # Pas de quantité, garder le produit actuel
+                    if current_prod is not None:
+                        prod_seq.append(f"{current_prod}(0.0)")
+            
+            f.write(" - ".join(prod_seq) + "\n\n")
+        
+        # Métriques
+        f.write(f"{solution['num_vehicles_used']}\n")
+        f.write(f"{solution['num_changeovers']}\n")
+        f.write(f"{solution['total_changeover']:.2f}\n")
         f.write(f"{solution['total_distance']:.2f}\n")
-        f.write("Intel Core i7-10700K\n")  # À adapter selon votre configuration
-        f.write(f"{solution['solving_time']:.3f}\n")
+        f.write("Intel Core i7-10700K\n")
+        f.write(f"{solution['elapsed_time']:.3f}\n")
 
-# ============================================================================
-# FONCTION PRINCIPALE
-# ============================================================================
 
-def solve_instance(instance_file_path, output_dir="solutions", time_limit=300):
-    """
-    Résout une instance MPVRP-CC et génère un fichier de solution.
-    
-    Args:
-        instance_file_path: Chemin vers le fichier d'instance .dat
-        output_dir: Répertoire de sortie pour les solutions
-        time_limit: Limite de temps en secondes
-    """
-    # Créer le répertoire de sortie
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Lire l'instance
-    print(f"Lecture de l'instance: {instance_file_path}")
-    try:
-        instance = read_instance(instance_file_path)
-        print(f"Instance chargée: {instance.uuid}")
-        print(f"  Produits: {instance.nb_products}, Dépôts: {instance.nb_depots}")
-        print(f"  Garages: {instance.nb_garages}, Stations: {instance.nb_stations}")
-        print(f"  Véhicules: {instance.nb_vehicles}")
-    except Exception as e:
-        print(f"Erreur lors de la lecture de l'instance: {e}")
-        return None
-    
-    # Résoudre le problème
-    solver = MPVRPSolver(instance, time_limit)
-    solution = solver.solve()
-    
-    if solution:
-        # Générer le nom du fichier de sortie
-        base_name = os.path.basename(instance_file_path)
-        if base_name.endswith('.dat'):
-            base_name = base_name[:-4]
-        
-        solution_file = os.path.join(output_dir, f"Sol_{base_name}.dat")
-        
-        # Écrire la solution
-        write_solution_file(instance, solution, solution_file)
-        print(f"Solution écrite dans: {solution_file}")
-        
-        # Afficher un résumé
-        print("\n=== RÉSUMÉ DE LA SOLUTION ===")
-        print(f"Véhicules utilisés: {len([r for r in solution['routes'].values() if r.arcs])}")
-        print(f"Distance totale: {solution['total_distance']:.2f}")
-        print(f"Changements de produit: {solution['total_product_changes']}")
-        print(f"Coût de transition: {solution['total_transition_cost']:.2f}")
-        print(f"Coût total (distance + transition): {solution['total_distance'] + solution['total_transition_cost']:.2f}")
-        print(f"Temps de résolution: {solution['solving_time']:.2f}s")
-        
-        return solution
-    else:
-        print("Aucune solution trouvée pour cette instance")
-        return None
-
-def batch_solve(instance_dir, output_dir="solutions", time_limit=300):
-    """
-    Résout toutes les instances dans un répertoire.
-    
-    Args:
-        instance_dir: Répertoire contenant les fichiers d'instance .dat
-        output_dir: Répertoire de sortie pour les solutions
-        time_limit: Limite de temps par instance (secondes)
-    """
-    # Lister tous les fichiers .dat
-    instance_files = []
-    for file in os.listdir(instance_dir):
-        if file.endswith('.dat'):
-            instance_files.append(os.path.join(instance_dir, file))
-    
-    if not instance_files:
-        print(f"Aucun fichier .dat trouvé dans {instance_dir}")
-        return
-    
-    print(f"Trouvé {len(instance_files)} instance(s) à résoudre")
-    
-    # Résoudre chaque instance
-    solutions = []
-    for i, instance_file in enumerate(instance_files, 1):
-        print(f"\n[{i}/{len(instance_files)}] Résolution de {os.path.basename(instance_file)}")
-        solution = solve_instance(instance_file, output_dir, time_limit)
-        if solution:
-            solutions.append((instance_file, solution))
-    
-    # Afficher un rapport final
-    if solutions:
-        print("\n" + "="*60)
-        print("RAPPORT FINAL")
-        print("="*60)
-        
-        total_distance = 0
-        total_transition_cost = 0
-        total_time = 0
-        
-        for instance_file, solution in solutions:
-            filename = os.path.basename(instance_file)
-            print(f"\n{filename}:")
-            print(f"  Véhicules: {len([r for r in solution['routes'].values() if r.arcs])}")
-            print(f"  Distance: {solution['total_distance']:.2f}")
-            print(f"  Transition: {solution['total_transition_cost']:.2f}")
-            print(f"  Temps: {solution['solving_time']:.2f}s")
-            
-            total_distance += solution['total_distance']
-            total_transition_cost += solution['total_transition_cost']
-            total_time += solution['solving_time']
-        
-        print("\n" + "="*60)
-        print(f"TOTAUX:")
-        print(f"  Distance totale: {total_distance:.2f}")
-        print(f"  Coût de transition total: {total_transition_cost:.2f}")
-        print(f"  Coût total: {total_distance + total_transition_cost:.2f}")
-        print(f"  Temps total de résolution: {total_time:.2f}s")
-        print("="*60)
-
-# ============================================================================
-# INTERFACE UTILISATEUR
-# ============================================================================
-
-def main():
-    """Fonction principale avec interface en ligne de commande."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(
-        description="Solveur MPVRP-CC (Multi-Product Vehicle Routing Problem with Changeover Cost)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Exemples d'utilisation:
-  %(prog)s instance.dat                     # Résoudre une instance
-  %(prog)s instances/ --batch               # Résoudre toutes les instances d'un répertoire
-  %(prog)s instance.dat --time-limit 600    # Résoudre avec une limite de 10 minutes
-        """
-    )
-    
-    parser.add_argument(
-        "input",
-        nargs="?",
-        help="Fichier d'instance .dat ou répertoire contenant des instances"
-    )
-    
-    parser.add_argument(
-        "--output-dir", "-o",
-        default="solutions",
-        help="Répertoire de sortie pour les solutions (défaut: solutions)"
-    )
-    
-    parser.add_argument(
-        "--time-limit", "-t",
-        type=int,
-        default=300,
-        help="Limite de temps par instance en secondes (défaut: 300)"
-    )
-    
-    parser.add_argument(
-        "--batch", "-b",
-        action="store_true",
-        help="Traiter tous les fichiers .dat du répertoire d'entrée"
-    )
-    
-    args = parser.parse_args()
-    
-    if not args.input:
-        parser.print_help()
-        return
-    
-    if args.batch:
-        # Mode batch: traiter un répertoire
-        if not os.path.isdir(args.input):
-            print(f"Erreur: {args.input} n'est pas un répertoire valide")
-            return
-        
-        batch_solve(args.input, args.output_dir, args.time_limit)
-    else:
-        # Mode single: traiter un fichier
-        if not os.path.isfile(args.input):
-            print(f"Erreur: {args.input} n'est pas un fichier valide")
-            return
-        
-        solve_instance(args.input, args.output_dir, args.time_limit)
+# ==============================================================================
+# MAIN
+# ==============================================================================
 
 if __name__ == "__main__":
-    main()
+    print("="*70)
+    print("SOLVEUR MPVRP-CC - VERSION FINALE")
+    print("="*70)
+    
+    instance_file = "MPVRP_S_047_s6_d1_p2.dat"
+    
+    try:
+        # Charger
+        instance = MPVRPInstance(instance_file)
+        
+        # Résoudre
+        solver = MPVRPSolver(instance, time_limit=300)
+        solver.build_model()
+        solution = solver.solve()
+        
+        if solution:
+            # Générer fichier solution
+            import os
+            basename = os.path.basename(instance_file)
+            output_file = f"Sol_{basename}"
+            
+            write_solution_file(solution, instance, output_file)
+            
+            print(f"\n Solution : {output_file}")
+            print(f"   Véhicules : {solution['num_vehicles_used']}")
+            print(f"   Distance  : {solution['total_distance']:.2f}")
+            print(f"   Changeover: {solution['total_changeover']:.2f}")
+            print(f"   Total     : {solution['total_distance'] + solution['total_changeover']:.2f}")
+    
+    except Exception as e:
+        print(f"\n ERREUR : {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print("\n FIN")
