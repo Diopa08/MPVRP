@@ -520,7 +520,7 @@ def validate_solution(instance, solution):
 
 if __name__ == "__main__":
     # Charger l'instance
-    instance_file = "MPVRP_L_001_s182_d9_p10.dat"
+    instance_file = "MPVRP_S_047_s6_d1_p2.dat"
     print(f" Chargement de l'instance: {instance_file}")
     
     instance = MPVRPInstance(instance_file)
